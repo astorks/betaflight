@@ -43,6 +43,7 @@
 
 #include "sensors/sensors.h"
 #include "sensors/barometer.h"
+#include "sensors/rangefinder.h"
 
 #include "pg/pg.h"
 #include "pg/pg_ids.h"
@@ -76,7 +77,8 @@ void positionInit(void)
 typedef enum {
     DEFAULT = 0,
     BARO_ONLY,
-    GPS_ONLY
+    GPS_ONLY,
+    RANGEFINDER_ONLY
 } altitudeSource_e;
 
 PG_REGISTER_WITH_RESET_TEMPLATE(positionConfig_t, positionConfig, PG_POSITION, 6);
@@ -88,7 +90,7 @@ PG_RESET_TEMPLATE(positionConfig_t, positionConfig,
     .altitude_d_lpf = 100,
 );
 
-#if defined(USE_BARO) || defined(USE_GPS)
+#if defined(USE_BARO) || defined(USE_GPS) || defined(USE_RANGEFINDER)
 void calculateEstimatedAltitude(void)
 {
     static bool wasArmed = false;
@@ -99,9 +101,11 @@ void calculateEstimatedAltitude(void)
     static float newBaroAltOffsetCm = 0.0f;
 
     float baroAltCm = 0.0f;
+    float rangefinderAltCm = 0.0f;
     float gpsTrust = 0.3f; // if no pDOP value, use 0.3, intended range 0-1;
     bool haveBaroAlt = false; // true if baro exists and has been calibrated on power up
     bool haveGpsAlt = false; // true if GPS is connected and while it has a 3D fix, set each run to false
+    bool haveRangefinderAlt = false;
 
     // *** Get sensor data
 #ifdef USE_BARO
@@ -124,6 +128,15 @@ void calculateEstimatedAltitude(void)
         }
         // always use at least 10% of other sources besides gps if available
         gpsTrust = MIN(gpsTrust, 0.9f);
+    }
+#endif
+#ifdef USE_RANGEFINDER
+    if (sensors(SENSOR_RANGEFINDER)) {
+        const int32_t rawRangefinderAlt = rangefinderGetLatestAltitude();
+        if (rawRangefinderAlt != RANGEFINDER_OUT_OF_RANGE) {
+            rangefinderAltCm = rawRangefinderAlt;
+            haveRangefinderAlt = true;
+        }
     }
 #endif
 
@@ -182,6 +195,27 @@ void calculateEstimatedAltitude(void)
         } else if (haveBaroAlt && (positionConfig()->altitude_source == DEFAULT || positionConfig()->altitude_source == BARO_ONLY)) {
             zeroedAltitudeCm = baroAltCm; // use Baro if no GPS data, or we want Baro only
         }
+
+        if (haveRangefinderAlt) {
+            if (positionConfig()->altitude_source == RANGEFINDER_ONLY) {
+                zeroedAltitudeCm = rangefinderAltCm;
+            } else if (positionConfig()->altitude_source == DEFAULT) {
+                // Mix rangefinder with existing estimate
+                // If we have a valid estimate from GPS/Baro, blend it.
+                // Rangefinder is typically more accurate for relative altitude over flat ground.
+                // We use a high trust factor for the rangefinder.
+                const float rfTrust = 0.75f;
+                
+                // Check if we have a base estimate from other sources
+                bool haveBaseEstimate = (useZeroedGpsAltitude || haveBaroAlt);
+                
+                if (haveBaseEstimate) {
+                    zeroedAltitudeCm = zeroedAltitudeCm * (1.0f - rfTrust) + rangefinderAltCm * rfTrust;
+                } else {
+                    zeroedAltitudeCm = rangefinderAltCm;
+                }
+            }
+        }
     }
 
     zeroedAltitudeCm = pt2FilterApply(&altitudeLpf, zeroedAltitudeCm);
@@ -212,10 +246,10 @@ void calculateEstimatedAltitude(void)
     DEBUG_SET(DEBUG_RTH, 1, lrintf(displayAltitudeCm / 10.0f));
     DEBUG_SET(DEBUG_AUTOPILOT_ALTITUDE, 2, lrintf(zeroedAltitudeCm));
 
-    altitudeAvailable = haveGpsAlt || haveBaroAlt;
+    altitudeAvailable = haveGpsAlt || haveBaroAlt || haveRangefinderAlt;
 }
 
-#endif //defined(USE_BARO) || defined(USE_GPS)
+#endif //defined(USE_BARO) || defined(USE_GPS) || defined(USE_RANGEFINDER)
 
 float getAltitudeCm(void)
 {
